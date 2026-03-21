@@ -1,0 +1,7 @@
+arabic-reshaper
+python-bidi
+gspread
+oauth2client
+reportlab
+streamlit
+Pillow
