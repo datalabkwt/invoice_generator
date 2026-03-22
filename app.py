@@ -31,11 +31,11 @@ script_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals
 assets_dir = os.path.join(script_dir, "assets")
 
 # --------------------------------------------------------
-# GOOGLE SHEETS CONFIG — update these two values
+# GOOGLE SHEETS CONFIG
 # --------------------------------------------------------
-CREDENTIALS_FILE = os.path.join(script_dir, "credentials.json")  # path to your downloaded JSON key
-SHEET_ID         = "1FEw1SEss8ZVXYLBeMwAYOxUCfVrjJZSwRM9cjF9RfmY"                   # paste your Sheet ID here
-SHEET_TAB_NAME   = "Invoice Log"                                  # name of the tab inside the sheet
+CREDENTIALS_FILE = os.path.join(script_dir, "credentials.json")
+SHEET_ID         = "1FEw1SEss8ZVXYLBeMwAYOxUCfVrjJZSwRM9cjF9RfmY"
+SHEET_TAB_NAME   = "Invoice Log"
 # --------------------------------------------------------
 
 
@@ -43,18 +43,32 @@ def get_gsheet():
     if not gspread_available:
         st.error("gspread/oauth2client not installed.")
         return None
-    if not os.path.exists(CREDENTIALS_FILE):
-        st.error(f"credentials.json not found at: {CREDENTIALS_FILE}")
-        return None
+
     try:
         scope = [
             "https://spreadsheets.google.com/feeds",
             "https://www.googleapis.com/auth/drive"
         ]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+
+        # ---- Streamlit Cloud: read from st.secrets ----
+        if "gcp_service_account" in st.secrets:
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+
+        # ---- Local: read from credentials.json file ----
+        elif os.path.exists(CREDENTIALS_FILE):
+            creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+
+        else:
+            st.error("No credentials found. Add credentials.json locally or set up Streamlit secrets.")
+            return None
+
     except Exception as e:
-        st.error(f"Failed to load credentials.json: {e}")
+        import traceback
+        st.error(f"Failed to load credentials: {e}")
+        st.code(traceback.format_exc())
         return None
+
     try:
         client = gspread.authorize(creds)
         sheet = client.open_by_key(SHEET_ID)
@@ -66,6 +80,7 @@ def get_gsheet():
         st.error(f"Failed to connect to Google Sheets: {e}")
         st.code(traceback.format_exc())
         return None
+
     try:
         worksheet = sheet.worksheet(SHEET_TAB_NAME)
     except gspread.exceptions.WorksheetNotFound:
@@ -81,14 +96,11 @@ def get_gsheet():
     except Exception as e:
         st.error(f"Failed to access worksheet: {e}")
         return None
+
     return worksheet
 
 
 def log_to_gsheet(worksheet, date_str, customer_name, customer_phone, rows, total):
-    """
-    Logs each invoice item as a separate row in the sheet.
-    All rows for the same invoice share the same date/customer/total.
-    """
     try:
         for row in rows:
             subtotal = row["quantity"] * row["price"]
@@ -104,7 +116,7 @@ def log_to_gsheet(worksheet, date_str, customer_name, customer_phone, rows, tota
             ])
         return True
     except Exception as e:
-        st.warning(f"⚠️ Failed to log to Google Sheets: {e}")
+        st.warning(f"Failed to log to Google Sheets: {e}")
         return False
 
 
@@ -166,11 +178,9 @@ st.header("🧾 Invoice Generator")
 
 # Warnings
 if not arabic_support:
-    st.warning("⚠️ Arabic reshaping libraries not installed. Run: `pip install arabic-reshaper python-bidi`")
+    st.warning("Arabic reshaping libraries not installed. Run: pip install arabic-reshaper python-bidi")
 if not gspread_available:
-    st.warning("⚠️ Google Sheets libraries not installed. Run: `pip install gspread oauth2client`")
-if gspread_available and not os.path.exists(CREDENTIALS_FILE):
-    st.warning("⚠️ `credentials.json` not found in script directory. Google Sheets logging is disabled.")
+    st.warning("Google Sheets libraries not installed. Run: pip install gspread oauth2client")
 
 # -------- HIDE +/- BUTTONS --------
 st.markdown("""
@@ -279,12 +289,10 @@ with col2:
                 # --------------------------------------------------------
                 LOGO_W, LOGO_H      = 260, 130
                 LOGO_Y              = height - 15 - LOGO_H
-
                 ARABIC_CROP_PX      = 250
                 ARABIC_W, ARABIC_H  = 220, 90
                 ARABIC_GAP          = 0
                 ARABIC_Y            = LOGO_Y + ARABIC_GAP - ARABIC_H
-
                 TITLE_Y             = ARABIC_Y - 22
                 # --------------------------------------------------------
 
