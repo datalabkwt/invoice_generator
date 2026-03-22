@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import streamlit as st
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -17,13 +18,97 @@ try:
 except ImportError:
     arabic_support = False
 
+# -------- GOOGLE SHEETS SUPPORT --------
+try:
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
+    gspread_available = True
+except ImportError:
+    gspread_available = False
+
 # Get script & template directory
 script_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
 assets_dir = os.path.join(script_dir, "assets")
 
+# --------------------------------------------------------
+# GOOGLE SHEETS CONFIG — update these two values
+# --------------------------------------------------------
+CREDENTIALS_FILE = os.path.join(script_dir, "credentials.json")  # path to your downloaded JSON key
+SHEET_ID         = "1FEw1SEss8ZVXYLBeMwAYOxUCfVrjJZSwRM9cjF9RfmY"                   # paste your Sheet ID here
+SHEET_TAB_NAME   = "Invoice Log"                                  # name of the tab inside the sheet
+# --------------------------------------------------------
+
+
+def get_gsheet():
+    if not gspread_available:
+        st.error("gspread/oauth2client not installed.")
+        return None
+    if not os.path.exists(CREDENTIALS_FILE):
+        st.error(f"credentials.json not found at: {CREDENTIALS_FILE}")
+        return None
+    try:
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+    except Exception as e:
+        st.error(f"Failed to load credentials.json: {e}")
+        return None
+    try:
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(SHEET_ID)
+    except gspread.exceptions.SpreadsheetNotFound:
+        st.error("Sheet not found. Check SHEET_ID and confirm sheet is shared with the service account.")
+        return None
+    except Exception as e:
+        import traceback
+        st.error(f"Failed to connect to Google Sheets: {e}")
+        st.code(traceback.format_exc())
+        return None
+    try:
+        worksheet = sheet.worksheet(SHEET_TAB_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        try:
+            worksheet = sheet.add_worksheet(title=SHEET_TAB_NAME, rows="1000", cols="20")
+            worksheet.append_row([
+                "Invoice Date", "Customer Name", "Customer Phone",
+                "Description", "Quantity", "Unit Price", "Subtotal", "Invoice Total"
+            ])
+        except Exception as e:
+            st.error(f"Failed to create worksheet tab: {e}")
+            return None
+    except Exception as e:
+        st.error(f"Failed to access worksheet: {e}")
+        return None
+    return worksheet
+
+
+def log_to_gsheet(worksheet, date_str, customer_name, customer_phone, rows, total):
+    """
+    Logs each invoice item as a separate row in the sheet.
+    All rows for the same invoice share the same date/customer/total.
+    """
+    try:
+        for row in rows:
+            subtotal = row["quantity"] * row["price"]
+            worksheet.append_row([
+                date_str,
+                customer_name,
+                customer_phone,
+                row["description"],
+                row["quantity"],
+                row["price"],
+                round(subtotal, 3),
+                round(total, 3)
+            ])
+        return True
+    except Exception as e:
+        st.warning(f"⚠️ Failed to log to Google Sheets: {e}")
+        return False
+
+
 # -------- REGISTER ARABIC FONT --------
-# Place Amiri-Regular.ttf in your assets/ folder.
-# Download free from: https://fonts.google.com/specimen/Amiri
 ARABIC_FONT_NAME = "Amiri"
 arabic_font_path = os.path.join(assets_dir, "Amiri-Regular.ttf")
 arabic_font_loaded = False
@@ -33,16 +118,10 @@ if os.path.exists(arabic_font_path):
 
 
 def has_arabic(text):
-    """Returns True if the text contains any Arabic characters."""
     return any('\u0600' <= ch <= '\u06FF' for ch in text)
 
 
 def reshape_arabic(text):
-    """
-    Reshapes Arabic letters so they connect properly,
-    then applies BiDi algorithm for correct RTL direction.
-    Requires: pip install arabic-reshaper python-bidi
-    """
     if arabic_support and has_arabic(text):
         reshaped = arabic_reshaper.reshape(text)
         return get_display(reshaped)
@@ -50,24 +129,16 @@ def reshape_arabic(text):
 
 
 def draw_text(c, x, y, text, fallback_font="Helvetica", size=10):
-    """
-    Draws text using Arabic font + reshaping if Arabic characters detected,
-    otherwise falls back to the standard font.
-    """
     if has_arabic(text) and arabic_font_loaded:
         c.setFont(ARABIC_FONT_NAME, size)
         c.drawString(x, y, reshape_arabic(text))
     else:
         c.setFont(fallback_font, size)
         c.drawString(x, y, text)
-    c.setFont(fallback_font, size)  # always reset to fallback after
+    c.setFont(fallback_font, size)
 
 
 def crop_top(image_path, crop_px=300):
-    """
-    Crops `crop_px` pixels from the TOP of the image to remove white padding.
-    Tune crop_px until the arabic text sits flush below the logo.
-    """
     img = Image.open(image_path)
     w, h = img.size
     cropped = img.crop((0, crop_px, w, h))
@@ -93,13 +164,13 @@ if os.path.exists(logo_display_path):
 
 st.header("🧾 Invoice Generator")
 
-# Warn if arabic libraries not installed
+# Warnings
 if not arabic_support:
-    st.warning(
-        "⚠️ Arabic reshaping libraries not installed. "
-        "Arabic text will not render correctly in the PDF. "
-        "Run: `pip install arabic-reshaper python-bidi`"
-    )
+    st.warning("⚠️ Arabic reshaping libraries not installed. Run: `pip install arabic-reshaper python-bidi`")
+if not gspread_available:
+    st.warning("⚠️ Google Sheets libraries not installed. Run: `pip install gspread oauth2client`")
+if gspread_available and not os.path.exists(CREDENTIALS_FILE):
+    st.warning("⚠️ `credentials.json` not found in script directory. Google Sheets logging is disabled.")
 
 # -------- HIDE +/- BUTTONS --------
 st.markdown("""
@@ -201,51 +272,36 @@ with col2:
             try:
                 pdf_buffer = io.BytesIO()
                 c = canvas.Canvas(pdf_buffer, pagesize=A4)
-                width, height = A4  # 595 x 842 pts
+                width, height = A4
 
                 # --------------------------------------------------------
-                # TUNING VARIABLES — adjust these to perfect the layout
+                # TUNING VARIABLES
                 # --------------------------------------------------------
-                LOGO_W, LOGO_H      = 260, 130      # logo rendered size
-                LOGO_Y              = height - 15 - LOGO_H   # logo bottom-left Y
+                LOGO_W, LOGO_H      = 260, 130
+                LOGO_Y              = height - 15 - LOGO_H
 
-                ARABIC_CROP_PX      = 250           # pixels cropped from TOP of arabic image
-                                                    # increase → removes more white padding from top
-                                                    # decrease → keeps more of the top whitespace
-                ARABIC_W, ARABIC_H  = 220, 90       # arabic image rendered size
-                ARABIC_GAP          = 0             # positive = move UP into logo's bottom space
-                                                    # negative = move DOWN away from logo
+                ARABIC_CROP_PX      = 250
+                ARABIC_W, ARABIC_H  = 220, 90
+                ARABIC_GAP          = 0
                 ARABIC_Y            = LOGO_Y + ARABIC_GAP - ARABIC_H
 
-                TITLE_Y             = ARABIC_Y - 22  # INVOICE title position
+                TITLE_Y             = ARABIC_Y - 22
                 # --------------------------------------------------------
 
                 # ---- LOGO ----
                 logo_path = os.path.join(assets_dir, "logo.png")
                 if os.path.exists(logo_path):
-                    c.drawImage(
-                        logo_path,
-                        width / 2 - LOGO_W / 2,
-                        LOGO_Y,
-                        width=LOGO_W,
-                        height=LOGO_H,
-                        preserveAspectRatio=True,
-                        mask='auto'
-                    )
+                    c.drawImage(logo_path, width / 2 - LOGO_W / 2, LOGO_Y,
+                                width=LOGO_W, height=LOGO_H,
+                                preserveAspectRatio=True, mask='auto')
 
-                # ---- ARABIC TEXT IMAGE (cropped + centered, directly below logo) ----
+                # ---- ARABIC TEXT IMAGE ----
                 arabic_path = os.path.join(assets_dir, "arabic-text.png")
                 if os.path.exists(arabic_path):
                     cropped_buf = crop_top(arabic_path, crop_px=ARABIC_CROP_PX)
-                    c.drawImage(
-                        ImageReader(cropped_buf),
-                        width / 2 - ARABIC_W / 2,
-                        ARABIC_Y,
-                        width=ARABIC_W,
-                        height=ARABIC_H,
-                        preserveAspectRatio=False,
-                        mask='auto'
-                    )
+                    c.drawImage(ImageReader(cropped_buf), width / 2 - ARABIC_W / 2, ARABIC_Y,
+                                width=ARABIC_W, height=ARABIC_H,
+                                preserveAspectRatio=False, mask='auto')
 
                 # ---- INVOICE TITLE ----
                 c.setFont("Helvetica-Bold", 24)
@@ -302,14 +358,10 @@ with col2:
                     y -= row_h
                     c.setFillColorRGB(0.97, 0.97, 0.97) if idx % 2 == 0 else c.setFillColorRGB(1, 1, 1)
                     c.rect(50, y - 3, width - 100, row_h, fill=1, stroke=0)
-
                     subtotal = row["quantity"] * row["price"]
                     c.setFillColorRGB(0, 0, 0)
-
-                    # Description — auto-detects Arabic and reshapes/reorders
                     desc_text = str(row["description"])[:45]
                     draw_text(c, col_desc_x + 5, y + 4, desc_text, size=10)
-
                     c.setFont("Helvetica", 10)
                     c.drawCentredString(col_qty_x + 30, y + 4, str(row["quantity"]))
                     c.drawCentredString(col_price_x + 30, y + 4, f"{row['price']:.3f}")
@@ -329,41 +381,31 @@ with col2:
                 if sig_top < 140:
                     sig_top = 140
 
-                # Thin divider above signatures
                 c.setStrokeColorRGB(0.7, 0.7, 0.7)
                 c.setLineWidth(0.5)
                 c.line(50, sig_top + 10, width - 50, sig_top + 10)
 
-                # ---- MANAGER (left) ----
+                # Manager (left)
                 c.setFillColorRGB(0, 0, 0)
                 c.setFont("Helvetica-Bold", 11)
                 c.drawString(50, sig_top - 8, "Manager")
 
-                # Dotted signature line
                 c.setStrokeColorRGB(0, 0, 0)
                 c.setLineWidth(0.5)
                 c.setDash(1, 3)
                 c.line(50, sig_top - 28, 200, sig_top - 28)
                 c.setDash()
 
-                # sig.png — floats ABOVE the dotted line
                 sig_path = os.path.join(assets_dir, "sig.png")
                 if os.path.exists(sig_path):
                     SIG_W = 150
                     SIG_H = 25
                     sig_x = 65
                     sig_y = sig_top - 28 + 3
-                    c.drawImage(
-                        sig_path,
-                        sig_x,
-                        sig_y,
-                        width=SIG_W,
-                        height=SIG_H,
-                        preserveAspectRatio=True,
-                        mask='auto'
-                    )
+                    c.drawImage(sig_path, sig_x, sig_y, width=SIG_W, height=SIG_H,
+                                preserveAspectRatio=True, mask='auto')
 
-                # Logo as stamp (rotated, over manager line) — YOUR TUNED VALUES KEPT
+                # Logo stamp
                 if os.path.exists(logo_path):
                     c.saveState()
                     c.translate(145, sig_top - 52)
@@ -372,12 +414,11 @@ with col2:
                                 preserveAspectRatio=True, mask='auto')
                     c.restoreState()
 
-                # ---- CUSTOMER (right) ----
+                # Customer (right)
                 c.setFillColorRGB(0, 0, 0)
                 c.setFont("Helvetica-Bold", 11)
                 c.drawRightString(width - 50, sig_top - 8, "Customer")
 
-                # Dotted signature line
                 c.setStrokeColorRGB(0, 0, 0)
                 c.setLineWidth(0.5)
                 c.setDash(1, 3)
@@ -393,6 +434,21 @@ with col2:
 
                 c.save()
                 pdf_buffer.seek(0)
+
+                # -------- LOG TO GOOGLE SHEETS --------
+                date_str_log = invoice_date.strftime("%d/%m/%Y")
+                worksheet = get_gsheet()
+                if worksheet:
+                    logged = log_to_gsheet(
+                        worksheet,
+                        date_str_log,
+                        customer_name,
+                        customer_phone,
+                        st.session_state.rows[:st.session_state.num_rows],
+                        total
+                    )
+                    if logged:
+                        st.success("✅ Invoice logged to Google Sheets successfully!")
 
                 st.download_button(
                     "**📥 DOWNLOAD INVOICE PDF**",
